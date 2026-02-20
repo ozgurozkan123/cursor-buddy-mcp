@@ -43,13 +43,13 @@ RUN mkdir -p .buddy/{rules,knowledge,todos,database,history,backups,indexes} && 
 # Switch to non-root user
 USER buddy
 
-# Set environment variables for SSE mode on Render
+# Set environment variables for HTTP mode on Render
 ENV BUDDY_PATH=/home/buddy/.buddy
-ENV MCP_MODE=sse
+ENV MCP_MODE=http
 ENV HOST=0.0.0.0
 
 # Expose port (Render sets PORT automatically)
 EXPOSE 8000
 
-# Run the MCP server in SSE mode
+# Run the MCP server in HTTP mode
 CMD ["buddy-mcp"]
