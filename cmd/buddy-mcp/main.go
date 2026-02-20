@@ -19,10 +19,12 @@ import (
 
 // createMCPServer creates and configures the MCP server with all tools
 func createMCPServer(buddyHandlers *handlers.BuddyHandlers) *server.MCPServer {
-	// Create MCP server
+	// Create MCP server with capabilities
 	mcpServer := server.NewMCPServer(
 		"Cursor Buddy MCP",
 		"1.0.0",
+		server.WithToolCapabilities(true),
+		server.WithResourceCapabilities(true, true),
 	)
 
 	// Register tool handlers
@@ -154,8 +156,27 @@ func createMCPServer(buddyHandlers *handlers.BuddyHandlers) *server.MCPServer {
 	return mcpServer
 }
 
-// runSSEServer runs the MCP server with SSE transport for remote HTTP access
-func runSSEServer(ctx context.Context, buddyPath string, port string) error {
+// corsMiddleware adds CORS headers for HTTP connections
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set CORS headers
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, Mcp-Session-Id, Last-Event-ID")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Type, Mcp-Session-Id")
+
+		// Handle preflight requests
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// runStreamableHTTPServer runs the MCP server with Streamable HTTP transport
+func runStreamableHTTPServer(ctx context.Context, buddyPath string, port string) error {
 	// Initialize the buddy handlers
 	buddyHandlers, err := handlers.NewBuddyHandlers(buddyPath)
 	if err != nil {
@@ -170,11 +191,9 @@ func runSSEServer(ctx context.Context, buddyPath string, port string) error {
 	// Create MCP server
 	mcpServer := createMCPServer(buddyHandlers)
 
-	// Create SSE server with configuration
-	sseServer := server.NewSSEServer(mcpServer,
-		server.WithSSEEndpoint("/sse"),
-		server.WithMessageEndpoint("/message"),
-		server.WithKeepAliveInterval(30*time.Second),
+	// Create Streamable HTTP server (stateless mode for serverless compatibility)
+	httpServer := server.NewStreamableHTTPServer(mcpServer,
+		server.WithStateLess(),
 	)
 
 	// Create HTTP mux for routing
@@ -184,31 +203,33 @@ func runSSEServer(ctx context.Context, buddyPath string, port string) error {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"healthy","service":"cursor-buddy-mcp"}`))
+		w.Write([]byte(`{"status":"healthy","service":"cursor-buddy-mcp","version":"1.0.0"}`))
 	})
 
 	// Root endpoint for info
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"name":"Cursor Buddy MCP","version":"1.0.0","transport":"streamable-http","endpoints":{"mcp":"/mcp","health":"/health"}}`))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"name":"Cursor Buddy MCP","version":"1.0.0","endpoints":{"sse":"/sse","message":"/message","health":"/health"}}`))
+		// Let MCP handler catch /mcp paths
+		http.NotFound(w, r)
 	})
 
-	// SSE endpoint - handles client connections
-	mux.HandleFunc("/sse", sseServer.ServeHTTP)
+	// MCP endpoint - handles both POST (commands) and GET (streaming)
+	mux.Handle("/mcp", httpServer)
+	mux.Handle("/mcp/", httpServer)
 
-	// Message endpoint - handles tool calls
-	mux.HandleFunc("/message", sseServer.ServeHTTP)
-
-	// Create HTTP server
+	// Create HTTP server with CORS middleware
 	addr := "0.0.0.0:" + port
-	httpServer := &http.Server{
-		Addr:    addr,
-		Handler: corsMiddleware(mux),
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      corsMiddleware(mux),
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// Handle graceful shutdown
@@ -217,15 +238,15 @@ func runSSEServer(ctx context.Context, buddyPath string, port string) error {
 		log.Println("Shutting down HTTP server...")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		httpServer.Shutdown(shutdownCtx)
+		srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("Starting Cursor Buddy MCP SSE server on %s", addr)
-	log.Printf("SSE endpoint: http://%s/sse", addr)
-	log.Printf("Message endpoint: http://%s/message", addr)
+	log.Printf("Starting Cursor Buddy MCP server on %s", addr)
+	log.Printf("MCP endpoint: http://%s/mcp", addr)
 	log.Printf("Health endpoint: http://%s/health", addr)
+	log.Println("Transport: Streamable HTTP (stateless)")
 
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("HTTP server error: %w", err)
 	}
 
@@ -262,32 +283,13 @@ func runStdioServer(ctx context.Context, buddyPath string) error {
 	return nil
 }
 
-// corsMiddleware adds CORS headers for SSE connections
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Set CORS headers
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
-		w.Header().Set("Access-Control-Expose-Headers", "Content-Type")
-
-		// Handle preflight requests
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
 func main() {
 	var (
 		buddyPath = flag.String("buddy-path", os.Getenv("BUDDY_PATH"), "Path to the .buddy directory")
 		version   = flag.Bool("version", false, "Show version information")
 		help      = flag.Bool("help", false, "Show help information")
-		sseMode   = flag.Bool("sse", false, "Run in SSE mode for HTTP access (default: stdio)")
-		port      = flag.String("port", "", "Port for SSE mode (default: PORT env var or 8000)")
+		httpMode  = flag.Bool("http", false, "Run in HTTP mode for remote access (default: stdio)")
+		port      = flag.String("port", "", "Port for HTTP mode (default: PORT env var or 8000)")
 	)
 
 	flag.Usage = func() {
@@ -298,12 +300,12 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment Variables:\n")
 		fmt.Fprintf(os.Stderr, "  BUDDY_PATH    Path to the .buddy directory (default: .buddy)\n")
-		fmt.Fprintf(os.Stderr, "  PORT          Port for SSE mode (default: 8000)\n")
-		fmt.Fprintf(os.Stderr, "  MCP_MODE      Set to 'sse' to run in SSE mode\n")
+		fmt.Fprintf(os.Stderr, "  PORT          Port for HTTP mode (default: 8000)\n")
+		fmt.Fprintf(os.Stderr, "  MCP_MODE      Set to 'http' to run in HTTP mode\n")
 		fmt.Fprintf(os.Stderr, "\nExample:\n")
 		fmt.Fprintf(os.Stderr, "  %s --buddy-path=/home/user/project/.buddy\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s --sse --port=8000\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  MCP_MODE=sse PORT=8000 %s\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --http --port=8000\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  MCP_MODE=http PORT=8000 %s\n", os.Args[0])
 	}
 
 	flag.Parse()
@@ -323,17 +325,17 @@ func main() {
 		*buddyPath = ".buddy"
 	}
 
-	// Determine port for SSE mode
-	ssePort := *port
-	if ssePort == "" {
-		ssePort = os.Getenv("PORT")
+	// Determine port for HTTP mode
+	httpPort := *port
+	if httpPort == "" {
+		httpPort = os.Getenv("PORT")
 	}
-	if ssePort == "" {
-		ssePort = "8000"
+	if httpPort == "" {
+		httpPort = "8000"
 	}
 
-	// Check if SSE mode is enabled via flag or environment
-	useSSE := *sseMode || os.Getenv("MCP_MODE") == "sse"
+	// Check if HTTP mode is enabled via flag or environment
+	useHTTP := *httpMode || os.Getenv("MCP_MODE") == "http" || os.Getenv("MCP_MODE") == "sse"
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -351,8 +353,8 @@ func main() {
 
 	// Run the appropriate server mode
 	var err error
-	if useSSE {
-		err = runSSEServer(ctx, *buddyPath, ssePort)
+	if useHTTP {
+		err = runStreamableHTTPServer(ctx, *buddyPath, httpPort)
 	} else {
 		err = runStdioServer(ctx, *buddyPath)
 	}
