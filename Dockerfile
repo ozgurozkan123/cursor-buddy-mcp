@@ -37,15 +37,19 @@ WORKDIR /home/buddy
 COPY --from=builder /app/buddy-mcp /usr/local/bin/buddy-mcp
 
 # Create default buddy directory structure
-RUN mkdir -p .buddy/{rules,knowledge,todos,database,history,backups} && \
+RUN mkdir -p .buddy/{rules,knowledge,todos,database,history,backups,indexes} && \
     chown -R buddy:buddy .buddy
 
 # Switch to non-root user
 USER buddy
 
-# Set environment variables
+# Set environment variables for SSE mode on Render
 ENV BUDDY_PATH=/home/buddy/.buddy
+ENV MCP_MODE=sse
+ENV HOST=0.0.0.0
 
-# MCP servers communicate via stdin/stdout, no port needed
-# CMD runs the MCP server
-CMD ["buddy-mcp"] 
+# Expose port (Render sets PORT automatically)
+EXPOSE 8000
+
+# Run the MCP server in SSE mode
+CMD ["buddy-mcp"]
