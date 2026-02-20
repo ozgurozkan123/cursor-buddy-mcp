@@ -191,9 +191,9 @@ func runStreamableHTTPServer(ctx context.Context, buddyPath string, port string)
 	// Create MCP server
 	mcpServer := createMCPServer(buddyHandlers)
 
-	// Create Streamable HTTP server (stateless mode for serverless compatibility)
+	// Create Streamable HTTP server (stateless mode for container compatibility)
 	httpServer := server.NewStreamableHTTPServer(mcpServer,
-		server.WithStateLess(),
+		server.WithStateLess(true),
 	)
 
 	// Create HTTP mux for routing
