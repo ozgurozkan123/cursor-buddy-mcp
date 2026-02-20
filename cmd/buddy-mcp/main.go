@@ -5,9 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -15,18 +17,8 @@ import (
 	"github.com/omar-haris/cursor-buddy-mcp/internal/monitor"
 )
 
-// runServer contains the main server logic that can be tested
-func runServer(ctx context.Context, buddyPath string) error {
-	// Initialize the buddy handlers
-	buddyHandlers, err := handlers.NewBuddyHandlers(buddyPath)
-	if err != nil {
-		return fmt.Errorf("failed to initialize buddy handlers: %w", err)
-	}
-
-	// Start file monitoring
-	fileMonitor := monitor.NewFileMonitor(buddyPath, buddyHandlers)
-	go fileMonitor.Start(ctx)
-
+// createMCPServer creates and configures the MCP server with all tools
+func createMCPServer(buddyHandlers *handlers.BuddyHandlers) *server.MCPServer {
 	// Create MCP server
 	mcpServer := server.NewMCPServer(
 		"Cursor Buddy MCP",
@@ -159,9 +151,105 @@ func runServer(ctx context.Context, buddyPath string) error {
 	)
 	mcpServer.AddResource(projectResource, buddyHandlers.GetProjectContextResourceHandler())
 
-	// Start server with context-aware serving
-	fmt.Println("Starting Cursor Buddy MCP server...")
+	return mcpServer
+}
 
+// runSSEServer runs the MCP server with SSE transport for remote HTTP access
+func runSSEServer(ctx context.Context, buddyPath string, port string) error {
+	// Initialize the buddy handlers
+	buddyHandlers, err := handlers.NewBuddyHandlers(buddyPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize buddy handlers: %w", err)
+	}
+	defer buddyHandlers.Close()
+
+	// Start file monitoring
+	fileMonitor := monitor.NewFileMonitor(buddyPath, buddyHandlers)
+	go fileMonitor.Start(ctx)
+
+	// Create MCP server
+	mcpServer := createMCPServer(buddyHandlers)
+
+	// Create SSE server with configuration
+	sseServer := server.NewSSEServer(mcpServer,
+		server.WithSSEEndpoint("/sse"),
+		server.WithMessageEndpoint("/message"),
+		server.WithKeepAliveInterval(30*time.Second),
+	)
+
+	// Create HTTP mux for routing
+	mux := http.NewServeMux()
+
+	// Health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"healthy","service":"cursor-buddy-mcp"}`))
+	})
+
+	// Root endpoint for info
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"name":"Cursor Buddy MCP","version":"1.0.0","endpoints":{"sse":"/sse","message":"/message","health":"/health"}}`))
+	})
+
+	// SSE endpoint - handles client connections
+	mux.HandleFunc("/sse", sseServer.ServeHTTP)
+
+	// Message endpoint - handles tool calls
+	mux.HandleFunc("/message", sseServer.ServeHTTP)
+
+	// Create HTTP server
+	addr := "0.0.0.0:" + port
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: corsMiddleware(mux),
+	}
+
+	// Handle graceful shutdown
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down HTTP server...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		httpServer.Shutdown(shutdownCtx)
+	}()
+
+	log.Printf("Starting Cursor Buddy MCP SSE server on %s", addr)
+	log.Printf("SSE endpoint: http://%s/sse", addr)
+	log.Printf("Message endpoint: http://%s/message", addr)
+	log.Printf("Health endpoint: http://%s/health", addr)
+
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("HTTP server error: %w", err)
+	}
+
+	return nil
+}
+
+// runStdioServer runs the MCP server with stdio transport for local use
+func runStdioServer(ctx context.Context, buddyPath string) error {
+	// Initialize the buddy handlers
+	buddyHandlers, err := handlers.NewBuddyHandlers(buddyPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize buddy handlers: %w", err)
+	}
+	defer buddyHandlers.Close()
+
+	// Start file monitoring
+	fileMonitor := monitor.NewFileMonitor(buddyPath, buddyHandlers)
+	go fileMonitor.Start(ctx)
+
+	// Create MCP server
+	mcpServer := createMCPServer(buddyHandlers)
+
+	// Start server with context-aware serving
+	fmt.Println("Starting Cursor Buddy MCP server (stdio mode)...")
 	log.Println("Cursor Buddy MCP server started")
 
 	// Serve stdio directly - this will block until stdin is closed or context is cancelled
@@ -174,11 +262,32 @@ func runServer(ctx context.Context, buddyPath string) error {
 	return nil
 }
 
+// corsMiddleware adds CORS headers for SSE connections
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set CORS headers
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Type")
+
+		// Handle preflight requests
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	var (
 		buddyPath = flag.String("buddy-path", os.Getenv("BUDDY_PATH"), "Path to the .buddy directory")
 		version   = flag.Bool("version", false, "Show version information")
 		help      = flag.Bool("help", false, "Show help information")
+		sseMode   = flag.Bool("sse", false, "Run in SSE mode for HTTP access (default: stdio)")
+		port      = flag.String("port", "", "Port for SSE mode (default: PORT env var or 8000)")
 	)
 
 	flag.Usage = func() {
@@ -189,9 +298,12 @@ func main() {
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment Variables:\n")
 		fmt.Fprintf(os.Stderr, "  BUDDY_PATH    Path to the .buddy directory (default: .buddy)\n")
+		fmt.Fprintf(os.Stderr, "  PORT          Port for SSE mode (default: 8000)\n")
+		fmt.Fprintf(os.Stderr, "  MCP_MODE      Set to 'sse' to run in SSE mode\n")
 		fmt.Fprintf(os.Stderr, "\nExample:\n")
 		fmt.Fprintf(os.Stderr, "  %s --buddy-path=/home/user/project/.buddy\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  BUDDY_PATH=/home/user/project/.buddy %s\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s --sse --port=8000\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  MCP_MODE=sse PORT=8000 %s\n", os.Args[0])
 	}
 
 	flag.Parse()
@@ -211,6 +323,18 @@ func main() {
 		*buddyPath = ".buddy"
 	}
 
+	// Determine port for SSE mode
+	ssePort := *port
+	if ssePort == "" {
+		ssePort = os.Getenv("PORT")
+	}
+	if ssePort == "" {
+		ssePort = "8000"
+	}
+
+	// Check if SSE mode is enabled via flag or environment
+	useSSE := *sseMode || os.Getenv("MCP_MODE") == "sse"
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -218,13 +342,22 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	// Run the server
-	if err := runServer(ctx, *buddyPath); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
+	// Start shutdown goroutine
+	go func() {
+		<-sigChan
+		log.Println("Shutting down...")
+		cancel()
+	}()
+
+	// Run the appropriate server mode
+	var err error
+	if useSSE {
+		err = runSSEServer(ctx, *buddyPath, ssePort)
+	} else {
+		err = runStdioServer(ctx, *buddyPath)
 	}
 
-	// Wait for shutdown signal
-	<-sigChan
-	log.Println("Shutting down...")
-	cancel()
+	if err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
 }
